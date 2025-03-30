@@ -1,4 +1,7 @@
-// LLM服务端点映射
+// 默认平台名称（可根据需要修改）
+const DEFAULT_PROVIDER = 'groq';
+
+// LLM service endpoint mappings
 const LLM_ENDPOINTS = {
   'openai': 'https://api.openai.com',
   'anthropic': 'https://api.anthropic.com',
@@ -7,103 +10,110 @@ const LLM_ENDPOINTS = {
   'sambanova': 'https://api.sambanova.ai',
   'azure': 'https://YOUR_AZURE_RESOURCE_NAME.openai.azure.com', // 需要替换为实际的Azure资源名
   'cerebras': 'https://cloud.cerebras.ai/',
-  // Add more providers as needed
-};
-
+  
 addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
+    event.respondWith(handleRequest(event.request));
 });
 
 async function handleRequest(request) {
-  console.log(`收到请求: ${request.method} ${request.url}`);
-
-  // 处理CORS预检请求
-  if (request.method === 'OPTIONS') {
-    return handleCORS(request);
-  }
-
-  const url = new URL(request.url);
-  const pathParts = url.pathname.split('/').filter(part => part);
-
-  // 检查路径中是否包含有效的LLM提供商
-  if (pathParts.length > 0 && LLM_ENDPOINTS[pathParts[0]]) {
-    const provider = pathParts[0];
-    const targetBaseUrl = LLM_ENDPOINTS[provider];
+    console.log(`Incoming request to: ${request.url}`);
     
-    // 构建目标URL
-    const remainingPath = pathParts.slice(1).join('/');
-    const finalTargetUrl = `${targetBaseUrl.replace(/\/$/, '')}/${remainingPath}${url.search}`;
+    if (request.method === 'OPTIONS') {
+        console.log('Handling CORS preflight request');
+        return handleCORS(request);
+    }
+    
+    const url = new URL(request.url);
+    const pathParts = url.pathname.split('/').filter(part => part);
+    
+    let provider;
+    let newPathname;
 
-    // 清理并构建新的请求头
+    // 检查路径是否指定了提供商
+    if (pathParts.length > 0 && LLM_ENDPOINTS[pathParts[0]]) {
+        // 路径中明确指定了提供商
+        provider = pathParts[0];
+        newPathname = '/' + pathParts.slice(1).join('/');
+    } else {
+        // 路径中未指定提供商，使用默认平台
+        provider = DEFAULT_PROVIDER;
+        newPathname = '/' + pathParts.join('/'); // 保留原始路径
+        console.log(`No provider specified, using default provider: ${provider}`);
+    }
+
+    const targetEndpoint = LLM_ENDPOINTS[provider];
+    console.log(`Proxying request to ${provider} at ${targetEndpoint}`);
+    
+    const targetUrl = new URL(targetEndpoint);
+    const endpointPath = targetUrl.pathname;
+    
+    // 修改URL拼接逻辑
+    if (endpointPath === '/') {
+        // 如果endpoint没有路径,直接使用新路径
+        targetUrl.pathname = newPathname;
+    } else {
+        // 如果endpoint有路径(如groq的/openai),需要特殊处理
+        if (provider === DEFAULT_PROVIDER && !pathParts[0]?.includes(provider)) {
+            // 直接域名访问且是默认provider(groq),需要保留endpoint路径
+            targetUrl.pathname = endpointPath.replace(/\/$/, '') + '/' + newPathname.replace(/^\//, '');
+        } else {
+            // 带平台访问或非默认provider,使用标准拼接
+            targetUrl.pathname = endpointPath.replace(/\/$/, '') + '/' + newPathname.replace(/^\//, '');
+        }
+    }
+    
+    targetUrl.search = url.search;
+    
     const cleanedHeaders = new Headers();
     for (const [key, value] of request.headers) {
-      const lowerKey = key.toLowerCase();
-      if (!lowerKey.startsWith('cf-') && 
-          !['host', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto',
-            'x-forwarded-host', 'x-forwarded-port', 'x-forwarded-scheme',
-            'x-forwarded-ssl', 'cdn-loop'].includes(lowerKey)) {
-        cleanedHeaders.set(key, value);
-      }
-    }
-
-    // 保留Content-Type
-    if (request.headers.has('Content-Type')) {
-      cleanedHeaders.set('Content-Type', request.headers.get('Content-Type'));
-    }
-
-    // 构建新的请求
-    const modifiedRequest = new Request(finalTargetUrl, {
-      method: request.method,
-      headers: cleanedHeaders,
-      body: request.body,
-      redirect: 'follow'
-    });
-
-    try {
-      // 转发请求到目标API
-      const response = await fetch(modifiedRequest);
-      
-      // 构建响应
-      const modifiedResponse = new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: new Headers(response.headers)
-      });
-
-      // 添加CORS头
-      modifiedResponse.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '*');
-      modifiedResponse.headers.set('Access-Control-Allow-Credentials', 'true');
-
-      // 移除Cloudflare相关头部
-      for (const [key] of modifiedResponse.headers) {
-        if (key.toLowerCase().startsWith('cf-')) {
-          modifiedResponse.headers.delete(key);
+        if (!key.toLowerCase().startsWith('cf-') && 
+            !['x-real-ip', 'x-forwarded-for', 'x-forwarded-proto', 
+              'x-forwarded-host', 'x-forwarded-port', 'x-forwarded-scheme',
+              'x-forwarded-ssl', 'cdn-loop'].includes(key.toLowerCase())) {
+            cleanedHeaders.set(key, value);
         }
-      }
-
-      return modifiedResponse;
-    } catch (error) {
-      console.error(`代理请求到${provider}时出错:`, error);
-      return new Response(`代理请求到${provider}失败: ${error.message}`, { status: 502 });
     }
-  }
-
-  return new Response(
-    `无效的LLM提供商路径。请使用 /provider/api/path 格式。可用提供商: ${Object.keys(LLM_ENDPOINTS).join(', ')}`, 
-    { status: 400 }
-  );
+    
+    const modifiedRequest = new Request(targetUrl.toString(), {
+        method: request.method,
+        headers: cleanedHeaders,
+        body: request.body,
+        redirect: 'follow'
+    });
+    
+    try {
+        console.log('Forwarding request with cleaned headers:', 
+                    JSON.stringify(Object.fromEntries(cleanedHeaders.entries()), null, 2));
+        const response = await fetch(modifiedRequest);
+        console.log(`Response received with status: ${response.status}`);
+        
+        const modifiedResponse = new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers
+        });
+        
+        modifiedResponse.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') || '*');
+        modifiedResponse.headers.set('Access-Control-Allow-Credentials', 'true');
+        
+        return modifiedResponse;
+    } catch (error) {
+        console.error(`Error proxying request to ${provider}:`, error);
+        return new Response(`Error proxying request to ${provider}: ${error.message}`, { status: 500 });
+    }
 }
 
 function handleCORS(request) {
-  // 处理CORS预检请求
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': request.headers.get('Origin') || '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
-    'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || 
-                                  'Content-Type, Authorization, Accept, Cache-Control, X-Requested-With',
-    'Access-Control-Allow-Credentials': 'true',
-    'Access-Control-Max-Age': '86400' // 预检请求缓存1天
-  };
-
-  return new Response(null, { status: 204, headers: corsHeaders });
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': request.headers.get('Origin') || '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || 'Content-Type, Authorization',
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Max-Age': '86400'
+    };
+    
+    return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+    });
 }
